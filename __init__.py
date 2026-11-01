@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import struct
 import urllib.request
 from html.parser import HTMLParser
@@ -15,8 +16,24 @@ NODE_DISPLAY_NAME_MAPPINGS = {}
 
 OLLAMA_BASE = os.environ.get("OLLAMA_INTERNAL_URL", "http://127.0.0.1:11434")
 CIVITAI_TOKEN = os.environ.get("CIVITAI_API_TOKEN", "")
+
+NODE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOCAL_GUIDE_PATH = os.path.join(NODE_DIR, "H3_ref_en.md")
+TMP_GUIDE_PATH = "/tmp/h3_setup/H3_ref_en.md"
+OFFICIAL_GUIDE_URL = (
+    "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/main/docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md"
+)
+
 CACHE_FILE = os.path.join(folder_paths.models_dir, "loras", ".civitai_cache.json")
 SKIP_KEYWORDS = ("turbo", "silu_temb", "pdd_8step", "lightx2v", "rank8")
+
+# Default prompt mode controlled by env var ("1", "true", "official" -> True)
+_USE_OFFICIAL_GUIDE = os.environ.get("USE_OFFICIAL_H3_GUIDE", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "official",
+)
 
 
 class HTMLStripper(HTMLParser):
@@ -37,6 +54,26 @@ def strip_html(text: str) -> str:
     s = HTMLStripper()
     s.feed(text)
     return s.get_data()
+
+
+def ensure_official_guide() -> str:
+    """Ensures H3_ref_en.md is saved locally on disk and returns its contents."""
+    if not os.path.exists(LOCAL_GUIDE_PATH) or os.path.getsize(LOCAL_GUIDE_PATH) < 1000:
+        if os.path.exists(TMP_GUIDE_PATH) and os.path.getsize(TMP_GUIDE_PATH) > 1000:
+            shutil.copyfile(TMP_GUIDE_PATH, LOCAL_GUIDE_PATH)
+        else:
+            print(f"[ActiveLoRATracker] Downloading official H3_ref_en.md to {LOCAL_GUIDE_PATH}...")
+            req = urllib.request.Request(
+                OFFICIAL_GUIDE_URL, headers={"User-Agent": "ComfyUI-ActiveLoRATracker/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                content = resp.read().decode("utf-8")
+            with open(LOCAL_GUIDE_PATH, "w", encoding="utf-8") as f:
+                f.write(content)
+            return content
+
+    with open(LOCAL_GUIDE_PATH, "r", encoding="utf-8") as f:
+        return f.read()
 
 
 def load_cache() -> dict:
@@ -171,7 +208,7 @@ def resolve_lora_metadata(lora_filename: str) -> dict | None:
 
 
 def get_running_workflow_loras() -> list:
-    """Reads the currently executing ComfyUI graph (bypassed nodes are already excluded)."""
+    """Reads the currently executing ComfyUI graph (bypassed/muted nodes are excluded)."""
     q = PromptServer.instance.prompt_queue
     running, pending = q.get_current_queue()
     graph = None
@@ -236,7 +273,7 @@ def build_enrichment_block() -> tuple[list, str]:
 
     base_rules = (
         "\n\n[CRITICAL H3 RULES]\n"
-        "- Do NOT emit <tool_call> tags or markdown code fences.\n"
+        "- Never emit <tool_call> or </tool_call> tags or markdown code fences. Output plain text only.\n"
         "- ISOLATED REFERENCE CROPS: If any input reference image shows a subject on a solid neutral grey (#B4B4B4), "
         "white, or blank background, extract ONLY the character/attire as <Subject N>. NEVER mention or describe "
         "the grey/blank studio backdrop in `subject_definitions` or `detailed_description`."
@@ -254,6 +291,17 @@ def build_enrichment_block() -> tuple[list, str]:
     return active, base_rules + lora_section
 
 
+def build_official_system_prompt(enrichment: str) -> str:
+    guide_text = ensure_official_guide()
+    header = (
+        "You are MiniMax H3-Context-IR. Output ONLY the final structured 6-section MiniMax H3 production prompt—"
+        "no conversational preamble and no markdown code fences.\n"
+        "NOTE ON LOCAL VIDEO REFERENCES: When <Video N> inputs are provided as sampled frame sequences without "
+        "attached audio tracks, infer motion and camera rhythm from the frame progression.\n\n"
+    )
+    return header + guide_text + enrichment
+
+
 def _forward_to_ollama(endpoint: str, method: str = "GET", payload: bytes | None = None) -> bytes:
     url = f"{OLLAMA_BASE.rstrip('/')}{endpoint}"
     headers = {"Content-Type": "application/json"} if payload else {}
@@ -262,39 +310,28 @@ def _forward_to_ollama(endpoint: str, method: str = "GET", payload: bytes | None
         return resp.read()
 
 
-@PromptServer.instance.routes.get("/active_loras/context")
-async def get_active_loras_debug(request):
-    active, enrichment = await asyncio.to_thread(build_enrichment_block)
-    return web.json_response({"active_loras": active, "enrichment": enrichment})
-
-
-@PromptServer.instance.routes.get("/active_loras/v1/models")
-async def proxy_models(request):
-    raw = await asyncio.to_thread(_forward_to_ollama, "/v1/models", "GET", None)
-    return web.Response(body=raw, content_type="application/json")
-
-
-@PromptServer.instance.routes.post("/active_loras/v1/chat/completions")
-async def proxy_chat_completions(request):
+async def _handle_chat_completions(request: web.Request, force_official: bool | None = None) -> web.Response:
     body = await request.json()
-    _, enrichment = await asyncio.to_thread(build_enrichment_block)
+    use_official = _USE_OFFICIAL_GUIDE if force_official is None else force_official
 
+    active, enrichment = await asyncio.to_thread(build_enrichment_block)
     messages = body.get("messages", [])
-    if enrichment and messages:
-        # Append rules + active LoRA metadata to the system prompt (or last user message)
+
+    if messages:
         sys_msg = next((m for m in messages if m.get("role") == "system"), None)
-        if sys_msg and isinstance(sys_msg.get("content"), str):
-            sys_msg["content"] += enrichment
+        if use_official:
+            official_prompt = await asyncio.to_thread(build_official_system_prompt, enrichment)
+            if sys_msg:
+                sys_msg["content"] = official_prompt
+            else:
+                messages.insert(0, {"role": "system", "content": official_prompt})
+            print(f"[ActiveLoRATracker] Mode: OFFICIAL H3_ref_en.md | Active LoRAs: {len(active)}")
         else:
-            last_msg = messages[-1]
-            content = last_msg.get("content", "")
-            if isinstance(content, str):
-                last_msg["content"] = content + enrichment
-            elif isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        part["text"] = part.get("text", "") + enrichment
-                        break
+            if sys_msg and isinstance(sys_msg.get("content"), str):
+                sys_msg["content"] += enrichment
+            else:
+                messages.insert(0, {"role": "system", "content": enrichment.strip()})
+            print(f"[ActiveLoRATracker] Mode: MINIMAX_REFPACK BUILT-IN | Active LoRAs: {len(active)}")
 
     raw_resp = await asyncio.to_thread(
         _forward_to_ollama,
@@ -303,3 +340,58 @@ async def proxy_chat_completions(request):
         json.dumps(body).encode("utf-8"),
     )
     return web.Response(body=raw_resp, content_type="application/json")
+
+
+# Pre-cache H3_ref_en.md on startup in a background thread so first run never lags
+asyncio.get_event_loop().run_in_executor(None, ensure_official_guide)
+
+
+@PromptServer.instance.routes.get("/active_loras/context")
+async def get_active_loras_debug(request):
+    active, enrichment = await asyncio.to_thread(build_enrichment_block)
+    return web.json_response(
+        {
+            "default_mode": "official" if _USE_OFFICIAL_GUIDE else "refpack",
+            "local_guide_cached": os.path.exists(LOCAL_GUIDE_PATH),
+            "active_loras": active,
+            "enrichment": enrichment,
+        }
+    )
+
+
+@PromptServer.instance.routes.get("/active_loras/mode/{mode}")
+async def set_default_prompt_mode(request):
+    global _USE_OFFICIAL_GUIDE
+    mode = request.match_info.get("mode", "").lower()
+    if mode in ("official", "1", "true"):
+        _USE_OFFICIAL_GUIDE = True
+    elif mode in ("refpack", "builtin", "0", "false"):
+        _USE_OFFICIAL_GUIDE = False
+    else:
+        return web.json_response({"error": "Use /active_loras/mode/official or /active_loras/mode/refpack"}, status=400)
+    return web.json_response({"default_mode": "official" if _USE_OFFICIAL_GUIDE else "refpack"})
+
+
+# Standard routes (follow _USE_OFFICIAL_GUIDE default)
+@PromptServer.instance.routes.get("/active_loras/v1/models")
+@PromptServer.instance.routes.get("/active_loras/official/v1/models")
+@PromptServer.instance.routes.get("/active_loras/refpack/v1/models")
+async def proxy_models(request):
+    raw = await asyncio.to_thread(_forward_to_ollama, "/v1/models", "GET", None)
+    return web.Response(body=raw, content_type="application/json")
+
+
+@PromptServer.instance.routes.post("/active_loras/v1/chat/completions")
+async def proxy_chat_default(request):
+    return await _handle_chat_completions(request, force_official=None)
+
+
+# Explicit URL-based mode overrides (switch directly inside the MiniMaxRefPack node's api_base widget)
+@PromptServer.instance.routes.post("/active_loras/official/v1/chat/completions")
+async def proxy_chat_official(request):
+    return await _handle_chat_completions(request, force_official=True)
+
+
+@PromptServer.instance.routes.post("/active_loras/refpack/v1/chat/completions")
+async def proxy_chat_refpack(request):
+    return await _handle_chat_completions(request, force_official=False)
